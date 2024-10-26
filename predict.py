@@ -1,6 +1,7 @@
 # Prediction interface for Cog ⚙️
 # https://github.com/replicate/cog/blob/main/docs/python.md
 
+from dataclasses import dataclass
 from cog import BasePredictor, Input, Path
 import os
 import time
@@ -8,8 +9,14 @@ import torch
 import subprocess
 import numpy as np
 from typing import List
-from diffusers import FluxPipeline
 from transformers import CLIPImageProcessor
+from PIL import Image
+from loras_cache import LorasCache
+from diffusers.pipelines.flux import (
+    FluxPipeline,
+    FluxInpaintPipeline,
+    FluxImg2ImgPipeline,
+)
 from diffusers.pipelines.stable_diffusion.safety_checker import (
     StableDiffusionSafetyChecker
 )
@@ -34,6 +41,7 @@ ASPECT_RATIOS = {
     "9:21": (640, 1536),
 }
 
+
 def download_weights(url, dest):
     start = time.time()
     print("downloading url: ", url)
@@ -41,8 +49,14 @@ def download_weights(url, dest):
     subprocess.check_call(["pget", "-xf", url, dest], close_fds=False)
     print("downloading took: ", time.time() - start)
 
+
 def make_multiple_of_16(x):
     return (x + 15) // 16 * 16
+
+@dataclass
+class LoadedLoRAs:
+    main: str | None
+    extra: str | None
 
 class Predictor(BasePredictor):
     def setup(self) -> None:
@@ -65,6 +79,28 @@ class Predictor(BasePredictor):
             MODEL_CACHE,
             torch_dtype=torch.bfloat16
         ).to("cuda")
+
+        pipe_kwargs = {
+            "transformer": self.txt2img_pipe.transformer,
+            "scheduler": self.txt2img_pipe.scheduler,
+            "vae": self.txt2img_pipe.vae,
+            "text_encoder": self.txt2img_pipe.text_encoder,
+            "text_encoder_2": self.txt2img_pipe.text_encoder_2,
+            "tokenizer": self.txt2img_pipe.tokenizer,
+            "tokenizer_2": self.txt2img_pipe.tokenizer_2,
+        }
+
+        # Load img2img pipelines
+        print("Loading Flux dev img2img pipeline")
+        self.img2img_pipe = FluxImg2ImgPipeline(**pipe_kwargs).to("cuda")
+
+        # Load inpainting pipelines
+        print("Loading Flux dev inpaint pipeline")
+        self.inpaint_pipe = FluxInpaintPipeline(**pipe_kwargs).to("cuda")
+        
+        self.loras_cache = LorasCache()
+        self.loaded_lora_urls = LoadedLoRAs(main=None, extra=None)
+
         print("setup took: ", time.time() - start)
 
     @torch.amp.autocast('cuda')
@@ -109,13 +145,47 @@ class Predictor(BasePredictor):
         ),
         num_inference_steps: int = Input(
             description="Number of inference steps",
-            ge=1,le=30,default=8,
+            ge=1, le=30, default=8,
         ),
         guidance_scale: float = Input(
             description="Guidance scale for the diffusion process",
-            ge=0,le=10,default=3.5,
+            ge=0, le=10, default=3.5,
         ),
         seed: int = Input(description="Random seed. Set for reproducible generation", default=None),
+        image: Path = Input(
+            description="Input image for img2img or inpainting mode. If provided, aspect_ratio, width, and height inputs are ignored.",
+            default=None,
+        ),
+        mask: Path = Input(
+            description="Input mask for inpainting mode. Black areas will be preserved, white areas will be inpainted. Must be provided along with 'image' for inpainting mode.",
+            default=None,
+        ),
+        prompt_strength: float = Input(
+            description="Prompt strength when using img2img / inpaint. 1.0 corresponds to full destruction of information in image",
+            ge=0.0,
+            le=1.0,
+            default=0.8,
+        ),
+        lora: str = Input(
+            description="Supports Replicate models in the format <owner>/<username> or <owner>/<username>/<version>, HuggingFace URLs in the format huggingface.co/<owner>/<model-name>, CivitAI URLs in the format civitai.com/models/<id>[/<model-name>], or arbitrary .safetensors URLs from the Internet. For example, 'fofr/flux-pixar-cars'",
+            default=None,
+        ),
+        lora_scale: float = Input(
+            description="Determines how strongly the main LoRA should be applied.",
+            default=1.0,
+            le=2.0,
+            ge=-1.0,
+        ),
+        extra_lora: str = Input(
+            description="A second(extra) LoRA, ignored if lora is not provided. Supports Replicate models in the format <owner>/<username> or <owner>/<username>/<version>, HuggingFace URLs in the format huggingface.co/<owner>/<model-name>, CivitAI URLs in the format civitai.com/models/<id>[/<model-name>], or arbitrary .safetensors URLs from the Internet. For example, 'fofr/flux-pixar-cars'",
+            default=None,
+        ),
+        extra_lora_scale: float = Input(
+            description="Determines how strongly the extra LoRA should be applied.",
+            default=1.0,
+            le=2.0,
+            ge=-1.0,
+        ),
         output_format: str = Input(
             description="Format of the output images",
             choices=["webp", "jpg", "png"],
@@ -148,12 +218,71 @@ class Predictor(BasePredictor):
             width, height = self.aspect_ratio_to_width_height(aspect_ratio)
         max_sequence_length = 512
 
+        is_img2img_mode = image is not None and mask is None
+        is_inpaint_mode = image is not None and mask is not None
+
         flux_kwargs = {}
         print(f"Prompt: {prompt}")
-        print("txt2img mode")
-        flux_kwargs["width"] = width
-        flux_kwargs["height"] = height
-        pipe = self.txt2img_pipe
+
+        if is_img2img_mode or is_inpaint_mode:
+            input_image = Image.open(image).convert("RGB")
+            original_width, original_height = input_image.size
+
+            # Calculate dimensions that are multiples of 16
+            target_width = make_multiple_of_16(original_width)
+            target_height = make_multiple_of_16(original_height)
+            target_size = (target_width, target_height)
+
+            print(
+                f"[!] Resizing input image from {original_width}x{original_height} to {target_width}x{target_height}"
+            )
+
+            # Determine if we should use highest quality settings
+            use_highest_quality = output_quality == 100 or output_format == "png"
+
+            # Resize the input image
+            resampling_method = Image.LANCZOS if use_highest_quality else Image.BICUBIC
+            input_image = input_image.resize(target_size, resampling_method)
+            flux_kwargs["image"] = input_image
+
+            # Set width and height to match the resized input image
+            flux_kwargs["width"], flux_kwargs["height"] = target_size
+
+            if is_img2img_mode:
+                print("[!] img2img mode")
+                pipe = self.img2img_pipe
+            else:  # is_inpaint_mode
+                print("[!] inpaint mode")
+                mask_image = Image.open(mask).convert("RGB")
+                mask_image = mask_image.resize(target_size, Image.NEAREST)
+                flux_kwargs["mask_image"] = mask_image
+                pipe = self.inpaint_pipe
+
+            flux_kwargs["strength"] = prompt_strength
+        else:  # is_txt2img_mode
+            print("[!] txt2img mode")
+            pipe = self.txt2img_pipe
+            flux_kwargs["width"] = width
+            flux_kwargs["height"] = height
+
+        if lora:
+            start_time = time.time()
+            if extra_lora:
+                flux_kwargs["joint_attention_kwargs"] = {"scale": 1.0}
+                print(f"Loading LoRA ({lora}) and extra LoRA ({extra_lora})")
+                self.load_multiple_loras(lora, extra_lora, pipe)
+                pipe.set_adapters(
+                    ["main", "extra"], adapter_weights=[lora_scale, extra_lora_scale]
+                )
+            else:
+                flux_kwargs["joint_attention_kwargs"] = {"scale": lora_scale}
+                print(f"Loading LoRA ({lora})")
+                self.load_single_lora(lora, pipe)
+                pipe.set_adapters(["main"], adapter_weights=[lora_scale])
+            print(f"Loaded LoRAs in {time.time() - start_time:.2f}s")
+        else:
+            pipe.unload_lora_weights()
+            self.loaded_lora_urls = LoadedLoRAs(main=None, extra=None)
 
         generator = torch.Generator("cuda").manual_seed(seed)
 
@@ -187,4 +316,40 @@ class Predictor(BasePredictor):
             raise Exception("NSFW content detected. Try running it again, or try a different prompt.")
 
         return output_paths
-    
+
+
+    def load_single_lora(self, lora_url: str, pipe: FluxPipeline | FluxImg2ImgPipeline | FluxInpaintPipeline):
+        # If no change, skip
+        if lora_url == self.loaded_lora_urls.main:
+            print("Weights already loaded")
+            return
+
+        pipe.unload_lora_weights()
+        lora_path = self.loras_cache.ensure(lora_url)
+        pipe.load_lora_weights(lora_path, adapter_name="main", low_cpu_mem_usage=True)
+        self.loaded_lora_urls = LoadedLoRAs(main=lora_url, extra=None)
+        pipe.to("cuda")
+
+    def load_multiple_loras(self, main_lora_url: str, extra_lora_url: str, pipe: FluxPipeline | FluxImg2ImgPipeline | FluxInpaintPipeline):
+
+        # If no change, skip
+        if (
+            main_lora_url == self.loaded_lora_urls.main
+            and extra_lora_url == self.loaded_lora_urls.extra
+        ):
+            print("Weights already loaded")
+            return
+
+        # We always need to load both?
+        pipe.unload_lora_weights()
+
+        main_lora_path = self.loras_cache.ensure(main_lora_url)
+        pipe.load_lora_weights(main_lora_path, adapter_name="main", low_cpu_mem_usage=True)
+
+        extra_lora_path = self.loras_cache.ensure(extra_lora_url)
+        pipe.load_lora_weights(extra_lora_path, adapter_name="extra", low_cpu_mem_usage=True)
+
+        self.loaded_lora_urls = LoadedLoRAs(
+            main=main_lora_url, extra=extra_lora_url
+        )
+        pipe.to("cuda")

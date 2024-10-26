@@ -8,9 +8,9 @@ build:
   python_packages:
     - "torch>=2.3"
     - "torchvision"
-    - "diffusers==0.30.1"
-    - "transformers==4.43.3"
-    - "accelerate==0.33.0"
+    - "diffusers==0.31.0"
+    - "transformers==4.46.0"
+    - "accelerate==0.34.1" # Maybe upgrade to v1.0?
     - "sentencepiece==0.2.0"
     - "protobuf==5.27.3"
     - "numpy==1.26.4"
