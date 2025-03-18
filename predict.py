@@ -45,6 +45,13 @@ def make_multiple_of_16(x):
     return (x + 15) // 16 * 16
 
 class Predictor(BasePredictor):
+    test_inputs = {
+        "prompt": "a dog smiling and looking directly at the camera, wearing a white t-shirt with the word \"HYPER\" printed on it.",
+        "width": 848,
+        "height": 848,
+        "seed": 0,
+    }
+
     def setup(self) -> None:
         """Load the model into memory to make running multiple predictions efficient"""
         start = time.time()
@@ -93,13 +100,13 @@ class Predictor(BasePredictor):
             description="Width of the generated image. Optional, only used when aspect_ratio=custom. Must be a multiple of 16 (if it's not, it will be rounded to nearest multiple of 16)",
             ge=256,
             le=1440,
-            default=None,
+            default=848,
         ),
         height: int = Input(
             description="Height of the generated image. Optional, only used when aspect_ratio=custom. Must be a multiple of 16 (if it's not, it will be rounded to nearest multiple of 16)",
             ge=256,
             le=1440,
-            default=None,
+            default=848,
         ),
         num_outputs: int = Input(
             description="Number of images to output.",
@@ -115,7 +122,7 @@ class Predictor(BasePredictor):
             description="Guidance scale for the diffusion process",
             ge=0,le=10,default=3.5,
         ),
-        seed: int = Input(description="Random seed. Set for reproducible generation", default=None),
+        seed: int = Input(description="Random seed. Set for reproducible generation", default=0),
         output_format: str = Input(
             description="Format of the output images",
             choices=["webp", "jpg", "png"],
@@ -133,7 +140,7 @@ class Predictor(BasePredictor):
         ),
     ) -> List[Path]:
         """Run a single prediction on the model"""
-        if seed is None:
+        if seed is None or seed == 0:
             seed = int.from_bytes(os.urandom(2), "big")
         print(f"Using seed: {seed}")
 
