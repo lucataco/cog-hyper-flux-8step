@@ -2,10 +2,11 @@
 
 This is an implementation of [ByteDance/Hyper-SD FLUX.1-dev 8-step](https://huggingface.co/ByteDance/Hyper-SD) as a [Cog](https://github.com/replicate/cog) model.
 
+- [x] Cog Fast Push Compatible
+
 ## Development
 
 Follow the [model pushing guide](https://replicate.com/docs/guides/push-a-model) to push your own model to [Replicate](https://replicate.com).
-
 
 ## How to use
 
