@@ -17,3 +17,9 @@ To run a prediction:
     cog predict -i prompt="a dog smiling and looking directly at the camera, wearing a white t-shirt with the word 'HYPER' printed on it."
 
 ![Output](output.0.png)
+
+## License
+
+The code in this repository is licensed under the [Apache License 2.0](LICENSE).
+
+The model weights are not covered by this license. [ByteDance/Hyper-SD](https://huggingface.co/ByteDance/Hyper-SD) is released under the [FLUX.1 [dev] Non-Commercial License](https://huggingface.co/ByteDance/Hyper-SD/blob/main/LICENSE.md), which allows non-commercial use only. Check its terms before use.
